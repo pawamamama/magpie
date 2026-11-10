@@ -3246,6 +3246,63 @@ func (a *keptAlive) outlives(d time.Duration) bool {
 	return a != nil && !a.clientEnd.IsZero() && time.Now().Add(d+clientRoom).After(a.clientEnd)
 }
 
+// clientHeartbeat is what a client of this protocol counts as life,
+// written to a waiting client so that its own idle timeout does not end the
+// turn while the provider is still working.
+//
+// A comment (": keepalive") is what every event-stream reader skips by the
+// letter of the spec, and two clients do not skip it:
+//
+//   - DeepSeek Harness, through llm-pi-ai's pi-ai: its OpenAI SDK drops the
+//     comment while parsing, so the reply's first chunk never arrives and
+//     the turn is cut at the harness's own step timeout.
+//   - Claude Code: its Anthropic parser counts a ping but not a comment, so
+//     a reply still waiting in a provider's queue is kept alive with
+//     something the client ignores.
+//
+// So the heartbeat is the protocol's own event: a chunk a Chat client parses
+// (an empty delta, which is a chunk and not a word), an Anthropic client's
+// ping. A Responses client is kept with response.in_progress by its encoder,
+// and a Gemini client is kept with nothing at all (its SDK reads "data: "
+// lines one after another and fails on anything else, #934).
+//
+// A heartbeat is a heartbeat and nothing else: it may not write a byte of the
+// reply (magpie-community/plugins#738: a ping released the held first piece
+// with the start of the placeholder in it, and Claude Code wrote {{...}} into
+// the file).
+// chatHeartbeat is what a held Chat stream is sent to keep its client alive:
+// the envelope an OpenAI-compatible reader parses, as chatEncoder.chunk writes
+// it (id/object/created/model/choices/usage), with an empty delta so the frame
+// is a chunk and not a word. It is safe to write raw here: this is the path
+// that forwards a provider's bytes unchanged, with no encoder numbering the
+// stream.
+var chatHeartbeat = []byte("data: {\"id\":\"chatcmpl-magpie-keepalive\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"magpie\",\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":null}\n\n")
+
+func clientHeartbeat(proto provider.Protocol) []byte {
+	// Only a Chat client is kept alive with a real event here; the others keep
+	// the SSE comment this function replaces, on purpose:
+	//
+	//   - Anthropic: the SDKs' MessageStream fails on any event before
+	//     message_start ("Unexpected event order, got ping before
+	//     message_start"), and this heartbeat goes out while the reply has not
+	//     started — which is what a held reply is (anthropicEncoder.keepalive
+	//     answers a comment there too). Claude Code is fed by the comment's
+	//     bytes either way, and a provider's queue is far shorter than the
+	//     600s its watchdogs allow.
+	//   - Responses: its events carry a sequence_number the encoder owns
+	//     (responsesEncoder.write); writing one raw here would number it out of
+	//     step with the encoder's own stream. Codex's quiet stream is met by
+	//     agentQuietMost in the gateway.
+	//
+	// A Chat client's OpenAI SDK, though, drops a comment while parsing: no
+	// chunk ever reaches it, so the harness's own step timeout ends the turn
+	// while the provider is still working. A chunk it parses is what it needs.
+	if proto != provider.Chat {
+		return nil
+	}
+	return chatHeartbeat
+}
+
 // keepAlive tells the agent of a stream held past keepHeldAfter for its
 // reasoning that it goes on, every keepHeldEvery: held for up to
 // holdThinking (4 minutes), the agent heard nothing at all, and Alma's
@@ -3286,8 +3343,13 @@ func (h *holdWriter) keepAlive() {
 		h.w.WriteHeader(http.StatusOK)
 		a.sent = true
 	}
-	// no blank line after it, as sseWriter.comment
-	_, _ = io.WriteString(h.w, ": keepalive\n")
+	// the heartbeat the client counts, not a comment it skips
+	if hb := clientHeartbeat(a.proto); hb != nil {
+		_, _ = h.w.Write(hb)
+	} else {
+		// no blank line after it, as sseWriter.comment
+		_, _ = io.WriteString(h.w, ": keepalive\n")
+	}
 	a.at = time.Now()
 	h.wrote, h.atLine = a.at, true
 	if f, ok := h.w.(http.Flusher); ok {
@@ -3729,8 +3791,13 @@ func (h *holdWriter) keepQuiet() {
 	if !h.atLine || time.Since(h.wrote) < keepaliveEvery || !strings.HasPrefix(h.w.Header().Get("Content-Type"), "text/event-stream") {
 		return
 	}
-	// no blank line after it, as sseWriter.comment
-	_, _ = io.WriteString(h.w, ": keepalive\n")
+	// the heartbeat the client counts, not a comment it skips
+	if hb := clientHeartbeat(h.alive.proto); hb != nil {
+		_, _ = h.w.Write(hb)
+	} else {
+		// no blank line after it, as sseWriter.comment
+		_, _ = io.WriteString(h.w, ": keepalive\n")
+	}
 	h.wrote = time.Now()
 	if f, ok := h.w.(http.Flusher); ok {
 		f.Flush()
